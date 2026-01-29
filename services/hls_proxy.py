@@ -312,26 +312,26 @@ class HLSProxy:
 
     async def _get_proxy_session(self, url: str):
         """Get a session with proxy support for the given URL.
-        
+
         Sessions are cached and reused for the same proxy to improve performance.
-        
-        Returns: (session, should_close) tuple
+
+        Returns: (session, proxy_url) tuple
         - session: The aiohttp ClientSession to use
-        - should_close: Always False now since sessions are cached and reused
+        - proxy_url: The proxy URL being used, or None for direct connection
         """
         proxy = get_proxy_for_url(url, TRANSPORT_ROUTES, GLOBAL_PROXIES)
-        
+
         if proxy:
             # Check if we have a cached session for this proxy
             if proxy in self.proxy_sessions:
                 cached_session = self.proxy_sessions[proxy]
                 if not cached_session.closed:
                     logger.debug(f"♻️ Reusing cached proxy session: {proxy}")
-                    return cached_session, False  # Reuse cached session
+                    return cached_session, proxy  # Reuse cached session
                 else:
                     # Remove closed session from cache
                     del self.proxy_sessions[proxy]
-            
+
             # Create new session and cache it
             logger.info(f"🌍 Creating proxy session: {proxy}")
             try:
@@ -345,12 +345,13 @@ class HLSProxy:
                 timeout = ClientTimeout(total=30)
                 session = ClientSession(timeout=timeout, connector=connector)
                 self.proxy_sessions[proxy] = session  # Cache the session
-                return session, False  # Don't close - it's cached for reuse
+                return session, proxy  # Return proxy URL for logging
             except Exception as e:
                 logger.warning(f"⚠️ Failed to create proxy connector: {e}, falling back to direct")
-        
+
         # Fallback to shared non-proxy session
-        return await self._get_session(), False
+        session = await self._get_session()
+        return session, None
 
 
     async def get_extractor(self, url: str, request_headers: dict, host: str = None):
@@ -821,16 +822,18 @@ class HLSProxy:
                             ssl_context = False
                         
                         # Use helper to get proxy-enabled session
-                        mpd_session, should_close = await self._get_proxy_session(stream_url)
+                        mpd_session, mpd_proxy = await self._get_proxy_session(stream_url)
+                        if mpd_proxy:
+                            logger.info(f"📡 [MPD] Using session via proxy: {mpd_proxy}")
                         final_mpd_url = stream_url  # Will be updated if redirected
-                        
+
                         try:
                             async with mpd_session.get(stream_url, headers=stream_headers, ssl=ssl_context, allow_redirects=True) as resp:
                                 # Capture final URL after redirects (use for segment URL construction)
                                 final_mpd_url = str(resp.url)
                                 if final_mpd_url != stream_url:
                                     logger.info(f"↪️ MPD redirected to: {final_mpd_url}")
-                                
+
                                 if resp.status != 200:
                                     error_text = await resp.text()
                                     logger.error(f"❌ Failed to fetch MPD. Status: {resp.status}, URL: {stream_url}")
@@ -839,9 +842,8 @@ class HLSProxy:
                                     return web.Response(text=f"Failed to fetch MPD: {resp.status}\nResponse: {error_text[:1000]}", status=502)
                                 manifest_content = await resp.text()
                         finally:
-                            # Close the session if we created one for proxy
-                            if should_close and mpd_session and not mpd_session.closed:
-                                await mpd_session.close()
+                            # Session is pooled/cached, so we don't close it
+                            pass
                         
                         # Build proxy base URL
                         scheme = request.headers.get('X-Forwarded-Proto', request.scheme)
@@ -1958,7 +1960,9 @@ class HLSProxy:
                     headers[header_name] = param_value
 
             # Get proxy-enabled session for segment fetches
-            segment_session, should_close = await self._get_proxy_session(url)
+            segment_session, segment_proxy = await self._get_proxy_session(url)
+            if segment_proxy:
+                logger.info(f"📡 [Decrypt] Using session via proxy: {segment_proxy}")
 
             try:
                 # Parallel download of init and media segment
@@ -1995,10 +1999,9 @@ class HLSProxy:
                 # Parallel fetch
                 init_content, segment_content = await asyncio.gather(fetch_init(), fetch_segment())
             finally:
-                # Close the session if we created one for proxy
-                if should_close and segment_session and not segment_session.closed:
-                    await segment_session.close()
-            
+                # Session is pooled/cached, so we don't close it
+                pass
+
             if init_content is None and init_url:
                 logger.error(f"❌ Failed to fetch init segment")
                 return web.Response(status=502)
